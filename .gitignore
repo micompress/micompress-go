@@ -1,1 +1,2 @@
-micompress
+# built binary at repo root only — must stay anchored so cmd/micompress/ is not ignored
+/micompress
