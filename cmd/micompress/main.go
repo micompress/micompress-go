@@ -16,8 +16,13 @@ import (
 )
 
 const (
-	base = "https://micompress.com"
-	ua   = "micompress-go/0.1.0 (+https://micompress.com)"
+	version = "0.1.2"
+	base    = "https://micompress.com"
+	ua      = "micompress-go/" + version + " (+https://micompress.com)"
+	// Explicit channel id for server-side attribution (see extend/README.md).
+	clientID   = "go/" + version
+	accountURL = "https://micompress.com/account"
+	plansURL   = "https://micompress.com/plans"
 )
 
 var extCategory = map[string]string{
@@ -45,6 +50,7 @@ var categoryPath = map[string]string{
 
 type meta struct {
 	Success      bool   `json:"success"`
+	Code         string `json:"code"`
 	Error        string `json:"error"`
 	DownloadURL  string `json:"downloadUrl"`
 	InputSize    int64  `json:"inputSize"`
@@ -76,8 +82,31 @@ func human(n int64) string {
 }
 
 type options struct {
-	preset, apiBase, suffix, output, token string
-	quiet                                  bool
+	preset, apiBase, suffix, output, token, apiKey string
+	quiet                                          bool
+}
+
+// describeError turns a failed API response into a helpful message
+// (adds hints for auth/quota error codes).
+func describeError(status int, m meta) error {
+	msg := m.Error
+	if msg == "" {
+		msg = fmt.Sprintf("HTTP %d", status)
+	}
+	// Only append a link when the server text doesn't already include it.
+	switch m.Code {
+	case "LOGIN_REQUIRED":
+		return fmt.Errorf("file exceeds the anonymous size limit. Pass --api-key <key> or set MICOMPRESS_API_KEY (free key at %s)", accountURL)
+	case "INVALID_API_KEY":
+		if !strings.Contains(msg, accountURL) {
+			return fmt.Errorf("%s Check your key at %s", msg, accountURL)
+		}
+	case "API_QUOTA_REACHED", "USAGE_LIMIT_REACHED":
+		if !strings.Contains(msg, plansURL) {
+			return fmt.Errorf("%s See plans and limits at %s", msg, plansURL)
+		}
+	}
+	return fmt.Errorf("%s", msg)
 }
 
 func compress(client *http.Client, path string, o options) ([]byte, meta, error) {
@@ -114,6 +143,10 @@ func compress(client *http.Client, path string, o options) ([]byte, meta, error)
 	req.Header.Set("Content-Type", w.FormDataContentType())
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", ua)
+	req.Header.Set("X-MiCompress-Client", clientID)
+	if o.apiKey != "" {
+		req.Header.Set("X-API-Key", o.apiKey)
+	}
 	if o.token != "" {
 		req.Header.Set("Authorization", "Bearer "+o.token)
 	}
@@ -127,10 +160,7 @@ func compress(client *http.Client, path string, o options) ([]byte, meta, error)
 		return nil, m, fmt.Errorf("unexpected response (HTTP %d)", res.StatusCode)
 	}
 	if !m.Success || m.DownloadURL == "" {
-		if m.Error != "" {
-			return nil, m, fmt.Errorf("%s", m.Error)
-		}
-		return nil, m, fmt.Errorf("HTTP %d", res.StatusCode)
+		return nil, m, describeError(res.StatusCode, m)
 	}
 
 	dreq, _ := http.NewRequest(http.MethodGet, strings.TrimRight(o.apiBase, "/")+m.DownloadURL, nil)
@@ -169,10 +199,19 @@ func main() {
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "-v", "--version":
-			fmt.Println("0.1.0")
+			fmt.Println(version)
 			return
 		case "-h", "--help":
-			fmt.Println("micompress <file...> [-o dir] [-p lossless|recommended|extreme] [--token jwt]")
+			fmt.Println("micompress <file...> [options]")
+			fmt.Println("  -o, --output DIR     Output directory")
+			fmt.Println("  -p, --preset NAME    lossless|recommended|extreme")
+			fmt.Println("      --api-key KEY    Personal API key from micompress.com/account")
+			fmt.Println("                       (or set MICOMPRESS_API_KEY)")
+			fmt.Println("      --token JWT      Legacy login token (still supported)")
+			fmt.Println("      --suffix STR     Suffix for output files (default -min)")
+			fmt.Println("      --api URL        API base URL")
+			fmt.Println("  -q, --quiet          Only print errors")
+			fmt.Println("Plans and limits: " + plansURL)
 			fmt.Println("Powered by micompress.com")
 			return
 		case "-q", "--quiet":
@@ -197,6 +236,11 @@ func main() {
 			if i < len(args) {
 				o.token = args[i]
 			}
+		case "--api-key":
+			i++
+			if i < len(args) {
+				o.apiKey = args[i]
+			}
 		case "--suffix":
 			i++
 			if i < len(args) {
@@ -206,6 +250,12 @@ func main() {
 			files = append(files, args[i])
 		}
 	}
+
+	// --api-key wins over the MICOMPRESS_API_KEY environment variable.
+	if o.apiKey == "" {
+		o.apiKey = os.Getenv("MICOMPRESS_API_KEY")
+	}
+	o.apiKey = strings.TrimSpace(o.apiKey)
 
 	if len(files) == 0 {
 		fmt.Fprintln(os.Stderr, "Usage: micompress <file...> [options]")
